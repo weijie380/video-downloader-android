@@ -1,0 +1,29 @@
+[
+  {
+    "file": "002.webp",
+    "bytes": 172804,
+    "sha256": "860da115016ab2e4ff10f3c62a0deebbcbb0dc7f360f75de8760f296f52e1f56",
+    "dimensions": [
+      1308,
+      1744
+    ],
+    "metadata": "Row: 0 _display_name=002 (1).webp, _size=172804, is_pending=0"
+  },
+  {
+    "file": "005.webp",
+    "bytes": 587796,
+    "sha256": "c8f07a878760a7324666526d93ae783bc3b96452f464ac8175ce742652636bc9",
+    "dimensions": [
+      1440,
+      1920
+    ],
+    "metadata": "Row: 0 _display_name=005 (1).webp, _size=587796, is_pending=0"
+  },
+  {
+    "file": "文案.txt",
+    "bytes": 192,
+    "sha256": "3677d8edeed074d41dcbf14a9577ff0e9568452058d095564f1fe33d4c3ccd0e",
+    "dimensions": null,
+    "metadata": "Row: 0 _display_name=文案 (1).txt, _size=192, is_pending=0"
+  }
+]

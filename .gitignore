@@ -1,0 +1,22 @@
+# 构建环境（Android SDK / Gradle 缓存），可整体删除
+.build-env/
+# 构建产物
+build/
+*/build/
+.gradle/
+local.properties
+*.iml
+.idea/
+.DS_Store
+captures/
+# 本机缓存和已交付安装包
+.kotlin/
+dist/
+# 登录凭据与签名私钥
+.env
+.env.*
+*.jks
+*.keystore
+*.p12
+# 保留本机更新签名，不上传 GitHub
+.signing/
