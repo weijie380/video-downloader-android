@@ -64,7 +64,7 @@ sdk.dir=/你的/Android/SDK/路径
 ./gradlew :app:testDebugUnitTest :app:assembleRelease
 ```
 
-本机已按用户要求移除本项目下载的 SDK、模拟器、Gradle 和缓存，已有 APK 保存在本机 `dist/`，不纳入源码仓库。
+本项目下载的 SDK、模拟器、Gradle 和缓存位于 `.build-env/`，上传完成后可整体删除；`.gradle/`、`.kotlin/`、`app/build/` 也可重新生成。已有 APK 保存在本机 `dist/`，不纳入源码仓库。
 
 原交付签名单独保留在本机 `.signing/debug.keystore`，该目录不上传 GitHub。以后在本机继续发布可覆盖旧版的 APK，使用原签名：
 
