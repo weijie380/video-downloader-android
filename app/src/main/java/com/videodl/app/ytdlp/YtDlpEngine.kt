@@ -205,10 +205,18 @@ object YtDlpEngine {
         val core = errorLine
             .replace(Regex("^ERROR:\\s*", RegexOption.IGNORE_CASE), "")
             .replace(Regex("^\\[\\w+\\]\\s*"), "")
+            .replace(Regex("(https?://[^\\s?]+)\\?[^\\s]+"), "$1?…")
             .trim()
             .take(2000)
             .ifBlank { "未知错误" }
-        return friendly(core)
+        val context = lines.filter { it != errorLine &&
+            listOf("HTTP Error", "Unable to download fragment", "timed out", "Connection reset")
+                .any { cause -> it.contains(cause, true) } }
+            .distinct().takeLast(3).joinToString("\n") { line ->
+                // 错误详情只保留主机和路径，不显示媒体地址里的签名或认证参数。
+                line.replace(Regex("(https?://[^\\s?]+)\\?[^\\s]+"), "$1?…").take(300)
+            }
+        return friendly(core) + if (context.isNotBlank()) "\n请求详情：\n$context" else ""
     }
 
     /**
@@ -218,6 +226,12 @@ object YtDlpEngine {
     private fun friendly(message: String): String {
         val lower = message.lowercase(Locale.ROOT)
         val hint = when {
+            lower.contains("downloaded file is empty") || lower.contains("did not get any data blocks") ->
+                "未收到有效的视频数据。可能是媒体链接已失效或分片连接失败；请检查 VPN／代理连接后重试。"
+
+            lower.contains("fragment not found") || lower.contains("unable to download fragment") ->
+                "视频分片下载失败，已停止保存以免生成残缺文件。请检查 VPN／代理连接后重试。"
+
             lower.contains("fresh cookies") ->
                 "抖音需要新的游客 Cookie，请在官方分享页完成游客验证后重试，无需注册账号。"
 

@@ -9,6 +9,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import com.videodl.app.MainActivity
@@ -25,6 +26,7 @@ import com.videodl.app.ytdlp.RequestPolicy
 import com.videodl.app.ytdlp.Platform
 import com.videodl.app.ytdlp.UrlUtils
 import com.videodl.app.ytdlp.YtDlpEngine
+import com.videodl.app.ytdlp.DownloadRecovery
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLException
 import com.yausername.youtubedl_android.YoutubeDLRequest
@@ -38,6 +40,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
@@ -86,6 +89,9 @@ class DownloadService : Service() {
     }
 
     override fun onDestroy() {
+        activeProcessIds.values.forEach { processId ->
+            runCatching { YoutubeDL.getInstance().destroyProcessById(processId) }
+        }
         activeGalleries.values.forEach { it.cancel() }
         scope.cancel()
         super.onDestroy()
@@ -112,8 +118,11 @@ class DownloadService : Service() {
         val tmpDir = File(cacheDir, "downloads/task_${task.id}")
         val processId = "task-${task.id}"
         activeProcessIds[task.id] = processId
+        val wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "videodl:download")
 
         try {
+            wakeLock.acquire(6 * 60 * 60 * 1000L)
             tmpDir.deleteRecursively()
             tmpDir.mkdirs()
 
@@ -146,7 +155,7 @@ class DownloadService : Service() {
                     resolver = "douyin_share", formatSelector = selected.selector)
             }
             if (TaskRepository.byId(task.id)?.statusEnum == TaskStatus.CANCELED) return
-            val response = downloadWithFallback(downloadTask, tmpDir, processId)
+            val response = downloadWithRecovery(downloadTask, tmpDir, processId)
             if (response.exitCode != 0) {
                 throw YoutubeDLException(response.err.ifBlank { "yt-dlp 退出码 ${response.exitCode}" })
             }
@@ -183,6 +192,7 @@ class DownloadService : Service() {
         } catch (t: Throwable) {
             if (TaskRepository.byId(task.id)?.statusEnum != TaskStatus.CANCELED) markFailed(task.id, t)
         } finally {
+            if (wakeLock.isHeld) wakeLock.release()
             activeProcessIds.remove(task.id)
             lastProgressWrite.remove(task.id)
             tmpDir.deleteRecursively()
@@ -256,6 +266,40 @@ class DownloadService : Service() {
 
     // ------------------------------------------------------------- download
 
+    private suspend fun downloadWithRecovery(
+        task: DownloadTaskEntity, tmpDir: File, processId: String,
+    ): com.yausername.youtubedl_android.YoutubeDLResponse {
+        try {
+            return downloadWithFallback(task, tmpDir, processId).also {
+                if (it.exitCode != 0) throw YoutubeDLException(it.err)
+            }
+        } catch (first: YoutubeDLException) {
+            if (Platform.fromKey(task.platform) != Platform.X ||
+                !DownloadRecovery.shouldRefresh(first.message)) throw first
+            currentCoroutineContext().ensureActive()
+            if (TaskRepository.byId(task.id)?.statusEnum == TaskStatus.CANCELED)
+                throw CancellationException("下载已取消")
+            // 再执行会重新提取媒体地址；保留非空 .part 与分片状态用于续传。
+            // 零字节成品会被 --no-overwrites 误认为已完成，必须先清理。
+            tmpDir.listFiles()?.filter { it.length() == 0L &&
+                (it.extension.lowercase() in MEDIA_EXTENSIONS || it.name.endsWith(".part")) }
+                ?.forEach { it.delete() }
+            TaskRepository.updateProgress(task.id, TaskStatus.DOWNLOADING, 0f, 0, 0,
+                "连接中断，正在重新获取媒体地址（1/1）", 0)
+            updateNotification("正在恢复下载（1/1）…", 0f, null, 0)
+            delay(1500)
+            if (TaskRepository.byId(task.id)?.statusEnum == TaskStatus.CANCELED)
+                throw CancellationException("下载已取消")
+            return try {
+                downloadWithFallback(task, tmpDir, processId).also {
+                    if (it.exitCode != 0) throw YoutubeDLException(it.err)
+                }
+            } catch (second: YoutubeDLException) {
+                throw YoutubeDLException("${first.message}\n恢复下载仍失败：\n${second.message}")
+            }
+        }
+    }
+
     private suspend fun downloadWithFallback(
         task: DownloadTaskEntity,
         tmpDir: File,
@@ -301,17 +345,23 @@ class DownloadService : Service() {
         val request = if (platform == Platform.DOUYIN) YoutubeDLRequest(emptyList<String>()) else YoutubeDLRequest(url)
         return request.apply {
             RequestPolicy.apply(this@DownloadService, this, platform, task.resolver, tmpDir)
+            DownloadRecovery.configure(this)
             if (platform == Platform.DOUYIN) addOption("--load-info-json", File(tmpDir, "share-info.json").absolutePath)
             addOption("--newline")
-            addOption("--no-warnings")
             addOption("--no-mtime")
             addOption("--continue")
             addOption("--no-overwrites")
             addOption("--trim-filenames", 120)
             addOption("--no-cache-dir")
 
-            task.formatSelector?.takeIf { it.isNotBlank() }?.let { addOption("-f", it) }
-            addOption("-o", File(tmpDir, "%(title).80s [%(id)s].%(ext)s").absolutePath)
+            task.formatSelector?.takeIf { it.isNotBlank() }?.let { selected ->
+                val height = FormatOption.listFromJson(task.formatOptionsJson)
+                    .firstOrNull { it.selector == selected }?.height ?: 0
+                addOption("-f", if (platform == Platform.X)
+                    DownloadRecovery.xSelector(height, selected) else selected)
+            }
+            // 媒体地址刷新后可能从 HLS 切到 HTTP；不同格式不可拼接同一 .part。
+            addOption("-o", File(tmpDir, "%(title).80s [%(id)s] [%(format_id)s].%(ext)s").absolutePath)
 
             if (mergeIntoMp4) addOption("--merge-output-format", "mp4")
 
@@ -345,7 +395,7 @@ class DownloadService : Service() {
             val current = TaskRepository.byId(taskId) ?: return@launch
             if (!TaskRepository.updateProgress(taskId, stage, (percent / 100f).coerceIn(0f, 1f),
                     (total * percent / 100.0).toLong(), total, speed, etaSeconds)) return@launch
-            updateNotification(current.title ?: current.url, percent, speed, etaSeconds)
+            updateNotification(current.title ?: current.url, (percent / 100f).coerceIn(0f, 1f), speed, etaSeconds)
         }
     }
 
