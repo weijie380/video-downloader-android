@@ -30,6 +30,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.BlurEffect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.layer.GraphicsLayer
@@ -95,7 +97,7 @@ internal fun GlassBottomBar(
             .selectableGroup().padding(6.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        listOf("首页", "下载队列").forEachIndexed { page, label ->
+        listOf("首页", "下载队列", "生图").forEachIndexed { page, label ->
             val selected = currentPage == page
             Column(
                 Modifier.weight(1f).clip(RoundedCornerShape(26.dp))
@@ -105,15 +107,32 @@ internal fun GlassBottomBar(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically),
             ) {
-                Icon(if (page == 0) Icons.Default.Home else Icons.AutoMirrored.Filled.List,
+                Icon(when (page) { 0 -> Icons.Default.Home; 1 -> Icons.AutoMirrored.Filled.List; else -> GenerateImageIcon },
                     contentDescription = null, tint = if (selected) primary else ink.copy(alpha = .7f),
                     modifier = Modifier.size(22.dp))
                 Text(label, style = MaterialTheme.typography.labelMedium,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                     color = if (selected) primary else ink.copy(alpha = .8f))
             }
         }
     }
 }
+
+private val GenerateImageIcon = ImageVector.Builder("GenerateImage", 24.dp, 24.dp, 24f, 24f).apply {
+    path(fill = androidx.compose.ui.graphics.SolidColor(Color.Black), pathFillType = androidx.compose.ui.graphics.PathFillType.EvenOdd) {
+        moveTo(19f, 3f); lineTo(5f, 3f); curveTo(3.9f, 3f, 3f, 3.9f, 3f, 5f)
+        lineTo(3f, 19f); curveTo(3f, 20.1f, 3.9f, 21f, 5f, 21f)
+        lineTo(19f, 21f); curveTo(20.1f, 21f, 21f, 20.1f, 21f, 19f)
+        lineTo(21f, 5f); curveTo(21f, 3.9f, 20.1f, 3f, 19f, 3f); close()
+        moveTo(5f, 5f); lineTo(19f, 5f); lineTo(19f, 16f)
+        lineTo(14f, 11f); lineTo(10f, 16f); lineTo(8f, 13f); lineTo(5f, 17f); close()
+    }
+    path(fill = androidx.compose.ui.graphics.SolidColor(Color.Black)) {
+        moveTo(9f, 8f); curveTo(9f, 9.1f, 8.1f, 10f, 7f, 10f)
+        curveTo(5.9f, 10f, 5f, 9.1f, 5f, 8f); curveTo(5f, 6.9f, 5.9f, 6f, 7f, 6f)
+        curveTo(8.1f, 6f, 9f, 6.9f, 9f, 8f); close()
+    }
+}.build()
 
 @Composable
 internal fun TaskPreview(task: DownloadTaskEntity) {

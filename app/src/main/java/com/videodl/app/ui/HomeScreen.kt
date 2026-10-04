@@ -84,6 +84,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.videodl.app.data.DownloadTaskEntity
 import com.videodl.app.data.TaskStatus
 import com.videodl.app.data.SavedAsset
@@ -104,7 +105,8 @@ fun HomeScreen(viewModel: MainViewModel) {
     var showXSession by remember { mutableStateOf(false) }
     var savedGallery by remember { mutableStateOf<List<SavedAsset>?>(null) }
     var xSessionSaved by remember { mutableStateOf(XSession.hasSavedSession(context)) }
-    val pager = rememberPagerState { 2 }
+    val imageViewModel: ImageGenerationViewModel = viewModel()
+    val pager = rememberPagerState { 3 }
     val scope = rememberCoroutineScope()
     val keyboard = LocalSoftwareKeyboardController.current
     val queueState = rememberLazyListState()
@@ -121,7 +123,7 @@ fun HomeScreen(viewModel: MainViewModel) {
             else pager.scrollToPage(page)
         }
     }
-    BackHandler(pager.currentPage == 1) { scope.launch { pager.animateScrollToPage(0) } }
+    BackHandler(pager.currentPage != 0) { scope.launch { pager.animateScrollToPage(0) } }
     val sessionBusy = viewModel.parsing || viewModel.updatingEngine || tasks.any {
         it.statusEnum.isRunning || it.statusEnum == TaskStatus.QUEUED
     }
@@ -134,13 +136,13 @@ fun HomeScreen(viewModel: MainViewModel) {
                 ),
                 title = {
                     Column {
-                        Text("视频下载器", style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            text = viewModel.engineError
+                        Text(if (pager.currentPage == 2) "AI 生图" else "视频下载器", style = MaterialTheme.typography.titleMedium)
+                        if (pager.currentPage != 2 || density.fontScale <= 1.5f) Text(
+                            text = if (pager.currentPage == 2) "描述画面 · 生成 · 保存" else viewModel.engineError
                                 ?: viewModel.engineVersion?.let { "yt-dlp $it" }
                                 ?: "解析引擎准备中…",
                             style = MaterialTheme.typography.labelSmall,
-                            color = if (viewModel.engineError != null) {
+                            color = if (pager.currentPage != 2 && viewModel.engineError != null) {
                                 MaterialTheme.colorScheme.error
                             } else {
                                 MaterialTheme.colorScheme.onSurfaceVariant
@@ -152,7 +154,7 @@ fun HomeScreen(viewModel: MainViewModel) {
                 },
                 actions = {
                     TextButton(onClick = { showNetwork = true }) { Text("网络") }
-                    TextButton(
+                    if (pager.currentPage != 2) TextButton(
                         onClick = { viewModel.updateEngine() },
                         enabled = !viewModel.updatingEngine && !viewModel.parsing &&
                             tasks.none { it.statusEnum.isRunning } && viewModel.engineError == null,
@@ -176,6 +178,9 @@ fun HomeScreen(viewModel: MainViewModel) {
                     },
                 verticalAlignment = Alignment.Top,
             ) { page ->
+                if (page == 2) {
+                    ImageGenerationScreen(imageViewModel, bottomPadding = barHeight + 40.dp)
+                } else {
                 LazyColumn(
                     state = if (page == 1) queueState else rememberLazyListState(),
                     modifier = Modifier.fillMaxSize(),
@@ -244,6 +249,7 @@ fun HomeScreen(viewModel: MainViewModel) {
                                 onError = { errorDetails = task.errorMessage })
                         }
                     }
+                }
                 }
             }
             GlassBottomBar(

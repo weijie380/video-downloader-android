@@ -13,8 +13,9 @@ android {
         applicationId = "com.videodl.app"
         minSdk = 29
         targetSdk = 34
-        versionCode = 11
-        versionName = "1.6.0"
+        versionCode = 12
+        versionName = "1.7.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         vectorDrawables { useSupportLibrary = true }
 
@@ -85,6 +86,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     implementation("androidx.room:room-runtime:2.6.1")
@@ -97,4 +99,8 @@ dependencies {
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }
