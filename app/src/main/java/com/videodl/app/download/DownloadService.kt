@@ -5,6 +5,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
@@ -33,6 +34,8 @@ import com.yausername.youtubedl_android.YoutubeDLRequest
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
@@ -47,11 +50,11 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * 串行下载服务。
+ * 两路并发下载服务，FFmpeg 后处理使用跨进程锁单独排队。
  *
- * 设计要点（对应计划里的「下载任务串行执行并持久保存」）：
+ * 设计要点：
  *  - 队列状态存在 Room 里，服务只负责「取出下一个 QUEUED 任务并执行」；
- *  - 一次只跑一个 yt-dlp 进程，避免多进程争抢带宽与 FFmpeg；
+ *  - 数据库事务原子领取，最多两个独立的 yt-dlp 进程；
  *  - 取消通过 YoutubeDL.destroyProcessById 杀掉 yt-dlp 子进程；
  *  - 完成后经 MediaStore 落到系统「下载/视频下载器」。
  */
@@ -60,16 +63,23 @@ class DownloadService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val workerLock = Any()
     private var workerJob: Job? = null
+    private val activeJobs = ConcurrentHashMap<Long, Job>()
+    @Volatile private var destroyed = false
 
     private val lastProgressWrite = ConcurrentHashMap<Long, Long>()
     private val activeProcessIds = ConcurrentHashMap<Long, String>()
     private val activeGalleries = ConcurrentHashMap<Long, DouyinImageDownloader>()
+    private data class Progress(val title: String, val percent: Float, val speed: String?, val eta: Long)
+    private val notificationProgress = ConcurrentHashMap<Long, Progress>()
+    private val lastNotificationWrite = mutableMapOf<Long, Long>()
+    private var lastSummaryWrite = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         YtDlpEngine.ensureInitialized(this)
+        SerialFFmpeg.install(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -89,6 +99,9 @@ class DownloadService : Service() {
     }
 
     override fun onDestroy() {
+        destroyed = true
+        notificationProgress.keys.forEach { NotificationManagerCompat.from(this).cancel(PROGRESS_TAG, it.hashCode()) }
+        notificationProgress.clear()
         activeProcessIds.values.forEach { processId ->
             runCatching { YoutubeDL.getInstance().destroyProcessById(processId) }
         }
@@ -102,16 +115,26 @@ class DownloadService : Service() {
     private fun ensureWorker() {
         synchronized(workerLock) {
             if (workerJob?.isActive == true) return
-            workerJob = scope.launch { runQueue() }
+            val job = scope.launch(start = CoroutineStart.LAZY) { runQueue() }
+            workerJob = job
+            job.invokeOnCompletion {
+                synchronized(workerLock) { if (workerJob === job) workerJob = null }
+                scope.launch {
+                    if (TaskRepository.hasQueuedOrRunning()) ensureWorker() else retireIfIdle()
+                }
+            }
+            job.start()
         }
     }
 
     private suspend fun runQueue() {
-        while (true) {
-            val next = TaskRepository.nextQueued() ?: break
-            process(next)
+        DownloadWorkers.run(TaskRepository::nextQueued, TaskRepository::hasQueuedOrRunning) { task ->
+            coroutineScope {
+                val job = launch(start = CoroutineStart.LAZY) { process(task) }
+                activeJobs[task.id] = job
+                try { job.start(); job.join() } finally { activeJobs.remove(task.id, job) }
+            }
         }
-        retireIfIdle()
     }
 
     private suspend fun process(task: DownloadTaskEntity) {
@@ -120,14 +143,17 @@ class DownloadService : Service() {
         activeProcessIds[task.id] = processId
         val wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "videodl:download")
+        var exportedVideo: Saved? = null
+        var videoCompleted = false
 
         try {
             wakeLock.acquire(6 * 60 * 60 * 1000L)
             tmpDir.deleteRecursively()
             tmpDir.mkdirs()
 
-            TaskRepository.resetTo(task.id, TaskStatus.DOWNLOADING, null)
-            updateNotification(task.title ?: task.url, 0f, null, 0L)
+            currentCoroutineContext().ensureActive()
+            if (TaskRepository.byId(task.id)?.statusEnum != TaskStatus.DOWNLOADING) return
+            updateNotification(task.id, task.title ?: task.url, 0f, null, 0L)
 
             var downloadTask = task
             if (Platform.fromKey(task.platform) == Platform.DOUYIN) {
@@ -163,12 +189,13 @@ class DownloadService : Service() {
             val produced = findProducedFile(tmpDir)
                 ?: throw IllegalStateException("下载已结束，但没有找到任何输出文件")
 
-            TaskRepository.setStatus(task.id, TaskStatus.SAVING)
-            updateNotification("正在保存到下载目录…", 1f, null, 0L)
+            if (!TaskRepository.beginSaving(task.id)) throw CancellationException("下载已取消")
+            updateNotification(task.id, "正在保存到下载目录…", 1f, null, 0L)
 
             val exported = saveToDownloads(task, produced)
+            exportedVideo = exported
 
-            TaskRepository.save(
+            videoCompleted = withContext(NonCancellable) { TaskRepository.complete(
                 task.copy(
                     status = TaskStatus.COMPLETED.name,
                     progress = 1f,
@@ -181,7 +208,10 @@ class DownloadService : Service() {
                     outputMp4 = exported.isMp4,
                     outputNote = exported.note,
                 )
-            )
+            ) }
+            if (!videoCompleted) {
+                throw CancellationException("下载已取消")
+            }
             notifyResult(task.id, task.title ?: exported.displayName, true, exported.note)
         } catch (e: YoutubeDL.CanceledException) {
             markCanceled(task.id)
@@ -192,9 +222,11 @@ class DownloadService : Service() {
         } catch (t: Throwable) {
             if (TaskRepository.byId(task.id)?.statusEnum != TaskStatus.CANCELED) markFailed(task.id, t)
         } finally {
+            if (!videoCompleted) exportedVideo?.let { runCatching { contentResolver.delete(it.uri, null, null) } }
             if (wakeLock.isHeld) wakeLock.release()
             activeProcessIds.remove(task.id)
             lastProgressWrite.remove(task.id)
+            removeProgressNotification(task.id)
             tmpDir.deleteRecursively()
         }
     }
@@ -226,7 +258,7 @@ class DownloadService : Service() {
                 val detail = "正在下载第 ${index + 1} 张（${position + 1}/${selection.indices.size}）"
                 TaskRepository.updateProgress(task.id, TaskStatus.DOWNLOADING,
                     position.toFloat() / selection.indices.size, downloaded, 0, detail, 0)
-                updateNotification(detail, position.toFloat() / selection.indices.size, null, 0)
+                updateNotification(task.id, detail, position.toFloat() / selection.indices.size, null, 0)
                 val file = downloader.download(image, tmpDir, index, gallery.shareUrl)
                 downloaded += file.length()
                 images += file
@@ -236,8 +268,8 @@ class DownloadService : Service() {
                 writeText("${gallery.caption}\n\n作者：${gallery.author}\n来源：${gallery.shareUrl}\n", Charsets.UTF_8)
             }
             val folder = "${MediaStoreExporter.sanitize(task.title ?: "抖音图文").take(50)} [${gallery.id}]"
-            TaskRepository.setStatus(task.id, TaskStatus.SAVING)
-            updateNotification("正在保存 ${images.size} 张图片及文案…", 1f, null, 0)
+            if (!TaskRepository.beginSaving(task.id)) throw CancellationException("图文保存已取消")
+            updateNotification(task.id, "正在保存 ${images.size} 张图片及文案…", 1f, null, 0)
             val assets = (images + caption).map { file ->
                 checkCanceled()
                 val mime = MediaStoreExporter.mimeTypeFor(file.extension)
@@ -250,12 +282,12 @@ class DownloadService : Service() {
             MediaStoreExporter.publish(this, exported)
             checkCanceled()
             val note = "${images.size} 张图片及文案 · 下载/视频下载器/$folder"
-            completed = TaskRepository.completeGallery(task.copy(status = TaskStatus.COMPLETED.name,
+            completed = withContext(NonCancellable) { TaskRepository.complete(task.copy(status = TaskStatus.COMPLETED.name,
                 progress = 1f, speedText = null, etaSeconds = 0, errorMessage = null,
                 outputFileName = "${images.size} 张图片及文案", outputUri = assets.first().uri,
                 outputFilesJson = SavedAsset.toJson(assets), outputBytes = assets.sumOf { it.bytes },
                 outputMp4 = false, outputNote = note, downloadedBytes = downloaded,
-                formatLabel = selection.label, downloadInfoJson = gallery.toJson()))
+                formatLabel = selection.label, downloadInfoJson = gallery.toJson())) }
             if (!completed) throw CancellationException("图文保存已取消")
             notifyResult(task.id, task.title ?: "抖音图文", true, note)
         } finally {
@@ -286,7 +318,7 @@ class DownloadService : Service() {
                 ?.forEach { it.delete() }
             TaskRepository.updateProgress(task.id, TaskStatus.DOWNLOADING, 0f, 0, 0,
                 "连接中断，正在重新获取媒体地址（1/1）", 0)
-            updateNotification("正在恢复下载（1/1）…", 0f, null, 0)
+            updateNotification(task.id, "正在恢复下载（1/1）…", 0f, null, 0)
             delay(1500)
             if (TaskRepository.byId(task.id)?.statusEnum == TaskStatus.CANCELED)
                 throw CancellationException("下载已取消")
@@ -346,6 +378,7 @@ class DownloadService : Service() {
         return request.apply {
             RequestPolicy.apply(this@DownloadService, this, platform, task.resolver, tmpDir)
             DownloadRecovery.configure(this)
+            SerialFFmpeg.configure(this@DownloadService, this)
             if (platform == Platform.DOUYIN) addOption("--load-info-json", File(tmpDir, "share-info.json").absolutePath)
             addOption("--newline")
             addOption("--no-mtime")
@@ -395,7 +428,7 @@ class DownloadService : Service() {
             val current = TaskRepository.byId(taskId) ?: return@launch
             if (!TaskRepository.updateProgress(taskId, stage, (percent / 100f).coerceIn(0f, 1f),
                     (total * percent / 100.0).toLong(), total, speed, etaSeconds)) return@launch
-            updateNotification(current.title ?: current.url, (percent / 100f).coerceIn(0f, 1f), speed, etaSeconds)
+            updateNotification(taskId, current.title ?: current.url, (percent / 100f).coerceIn(0f, 1f), speed, etaSeconds)
         }
     }
 
@@ -420,7 +453,7 @@ class DownloadService : Service() {
         val page = task.pageIndex?.takeIf { it > 1 }?.let { " P$it" }.orEmpty()
 
         val displayName = "${MediaStoreExporter.sanitize(base)}$quality$page.$extension"
-        val exported = MediaStoreExporter.export(this, produced, displayName, mime)
+        val exported = MediaStoreExporter.export(this, produced, displayName, mime, replaceExisting = false)
 
         val note = buildString {
             if (task.pageIndex != null && task.pageIndex > 1) append("B站第 ${task.pageIndex} P · ")
@@ -446,17 +479,27 @@ class DownloadService : Service() {
         val task = TaskRepository.byId(id) ?: return
         if (task.statusEnum.isFinished) return
 
+        // 先保护数据库状态，再停止这一条的进程/协程，不影响另一条任务。
+        if (TaskRepository.cancelIfActive(id) == 0) return
+        stopTaskWork(id)
+    }
+
+    private fun stopTaskWork(id: Long) {
+        removeProgressNotification(id)
+        activeJobs[id]?.cancel()
+
         activeProcessIds[id]?.let { processId ->
             runCatching { YoutubeDL.getInstance().destroyProcessById(processId) }
         }
         activeGalleries[id]?.cancel()
-        markCanceled(id)
     }
 
     private suspend fun cancelAll() {
-        val all = TaskRepository.all()
-        all.filter { it.statusEnum == TaskStatus.QUEUED || it.statusEnum.isRunning }
-            .forEach { cancelTask(it.id) }
+        val ids = TaskRepository.all().filter { it.statusEnum in setOf(TaskStatus.QUEUED,
+            TaskStatus.DOWNLOADING, TaskStatus.MERGING, TaskStatus.SAVING) }.map { it.id }
+        // 一次更新所有队列状态，避免取消途中空位又启动后续任务。
+        if (ids.isNotEmpty()) TaskRepository.cancelBatch(ids)
+        ids.forEach { stopTaskWork(it) }
     }
 
     private suspend fun markCanceled(id: Long) {
@@ -469,14 +512,7 @@ class DownloadService : Service() {
             else -> error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
         }
         val task = TaskRepository.byId(id) ?: return
-        TaskRepository.save(
-            task.copy(
-                status = TaskStatus.FAILED.name,
-                speedText = null,
-                etaSeconds = 0,
-                errorMessage = reason,
-            )
-        )
+        if (!TaskRepository.failIfActive(id, reason)) return
         notifyResult(id, task.title ?: task.url, false, reason)
     }
 
@@ -504,6 +540,7 @@ class DownloadService : Service() {
         val busy = TaskRepository.hasQueuedOrRunning()
         if (busy) return
         withContext(Dispatchers.Main) {
+            if (synchronized(workerLock) { workerJob != null } || destroyed) return@withContext
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -524,10 +561,31 @@ class DownloadService : Service() {
         }
     }
 
-    private fun updateNotification(title: String, percent: Float, speed: String?, eta: Long) {
-        val notification = buildNotification(title, percent, speed, eta)
+    @Synchronized
+    private fun updateNotification(taskId: Long, title: String, percent: Float, speed: String?, eta: Long) {
+        if (destroyed) return
+        notificationProgress[taskId] = Progress(title, percent, speed, eta)
+        val now = SystemClock.elapsedRealtime()
+        if (now - (lastNotificationWrite[taskId] ?: 0L) < 1000L) return
+        lastNotificationWrite[taskId] = now
         runCatching {
-            NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, notification)
+            val manager = NotificationManagerCompat.from(this)
+            manager.notify(PROGRESS_TAG, taskId.hashCode(), buildNotification(title, percent, speed, eta, taskId))
+            if (now - lastSummaryWrite >= 1000L) {
+                lastSummaryWrite = now
+                manager.notify(NOTIFICATION_ID, buildNotification("准备下一条下载…", 0f, null, 0))
+            }
+        }
+    }
+
+    @Synchronized
+    private fun removeProgressNotification(taskId: Long) {
+        notificationProgress.remove(taskId)
+        lastNotificationWrite.remove(taskId)
+        runCatching {
+            val manager = NotificationManagerCompat.from(this)
+            manager.cancel(PROGRESS_TAG, taskId.hashCode())
+            if (!destroyed) manager.notify(NOTIFICATION_ID, buildNotification("准备下一条下载…", 0f, null, 0))
         }
     }
 
@@ -536,6 +594,7 @@ class DownloadService : Service() {
         percent: Float,
         speed: String?,
         eta: Long,
+        taskId: Long? = null,
     ): Notification {
         val open = PendingIntent.getActivity(
             this,
@@ -546,8 +605,11 @@ class DownloadService : Service() {
         )
         val cancel = PendingIntent.getService(
             this,
-            1,
-            Intent(this, DownloadService::class.java).setAction(ACTION_CANCEL_ALL),
+            taskId?.hashCode() ?: 1,
+            Intent(this, DownloadService::class.java).apply {
+                setAction(if (taskId == null) ACTION_CANCEL_ALL else ACTION_CANCEL_TASK)
+                if (taskId != null) { putExtra(EXTRA_TASK_ID, taskId); data = Uri.parse("videodl://task/$taskId") }
+            },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
@@ -558,13 +620,20 @@ class DownloadService : Service() {
             if (eta > 0) append(" · 剩余 ${formatEta(eta)}")
         }
 
+        val lines = notificationProgress.entries.sortedBy { it.key }.map { (_, item) ->
+            "${item.title.take(32)} · ${(item.percent.coerceIn(0f, 1f) * 100).toInt()}%" +
+                item.speed?.let { " · $it" }.orEmpty()
+        }
         return NotificationCompat.Builder(this, com.videodl.app.VideoDlApp.CHANNEL_PROGRESS)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("正在下载")
-            .setContentText(title.take(60))
-            .setSubText(detail)
+            .setContentTitle(if (taskId == null && lines.isNotEmpty()) "下载进行中 · ${lines.size}/${DownloadWorkers.LIMIT}" else "正在下载")
+            .setContentText(if (taskId == null && lines.isNotEmpty()) lines.joinToString("\n") else title.take(60))
+            .setSubText(if (taskId == null) "最多同时下载 ${DownloadWorkers.LIMIT} 条" else detail)
+            .setStyle(if (taskId == null) NotificationCompat.InboxStyle().also { style -> lines.forEach { style.addLine(it) } } else null)
             .setContentIntent(open)
-            .addAction(0, "全部取消", cancel)
+            .addAction(0, if (taskId == null) "全部取消" else "取消此条", cancel)
+            .setGroup("videodl.downloads")
+            .setGroupSummary(taskId == null)
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setProgress(100, progress, percent <= 0f)
@@ -595,7 +664,7 @@ class DownloadService : Service() {
             .setAutoCancel(true)
             .build()
         runCatching {
-            NotificationManagerCompat.from(this).notify(taskId.toInt(), notification)
+            NotificationManagerCompat.from(this).notify(RESULT_TAG, taskId.hashCode(), notification)
         }
     }
 
@@ -621,6 +690,8 @@ class DownloadService : Service() {
         private const val EXTRA_TASK_ID = "task_id"
 
         private const val NOTIFICATION_ID = 1001
+        private const val PROGRESS_TAG = "task-progress"
+        private const val RESULT_TAG = "task-result"
         private const val PROGRESS_INTERVAL_MS = 400L
 
         private val SPEED_REGEX = Regex("""at\s+([\d.]+\s*[KMGT]i?B/s)""")

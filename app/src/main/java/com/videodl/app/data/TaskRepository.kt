@@ -4,7 +4,7 @@ import android.content.Context
 import kotlinx.coroutines.flow.Flow
 
 /**
- * 任务队列的唯一入口。所有读写都经过这里，保证串行 Worker 与界面看到同一份状态。
+ * 任务队列的唯一入口。并发 worker 原子领取任务，与界面共用同一份状态。
  */
 object TaskRepository {
 
@@ -37,10 +37,18 @@ object TaskRepository {
         taskDao.update(task.copy(updatedAt = System.currentTimeMillis()))
     }
 
-    suspend fun completeGallery(task: DownloadTaskEntity): Boolean =
-        taskDao.completeGalleryIfSaving(task.copy(updatedAt = System.currentTimeMillis()))
+    suspend fun complete(task: DownloadTaskEntity): Boolean =
+        taskDao.completeIfSaving(task.copy(updatedAt = System.currentTimeMillis()))
+
+    suspend fun enqueueIfReady(id: Long): Boolean = taskDao.enqueueIfReady(id, System.currentTimeMillis()) > 0
+
+    suspend fun failIfActive(id: Long, reason: String): Boolean =
+        taskDao.failIfActive(id, reason, System.currentTimeMillis()) > 0
+
+    suspend fun beginSaving(id: Long): Boolean = taskDao.beginSaving(id, System.currentTimeMillis()) > 0
 
     suspend fun cancelIfActive(id: Long) = taskDao.cancelIfActive(id, System.currentTimeMillis())
+    suspend fun cancelBatch(ids: List<Long>) = taskDao.cancelBatchIfActive(ids, System.currentTimeMillis())
 
     suspend fun updateProgress(id: Long, status: TaskStatus, progress: Float, downloaded: Long,
         total: Long, speed: String?, eta: Long): Boolean =
@@ -53,7 +61,7 @@ object TaskRepository {
         taskDao.resetTo(id, status.name, reason)
 
     suspend fun nextQueued(): DownloadTaskEntity? =
-        taskDao.firstWithStatus(TaskStatus.QUEUED.name)
+        taskDao.claimNextQueued()
 
     suspend fun busyCount(): Int = taskDao.countWithStatuses(
         listOf(

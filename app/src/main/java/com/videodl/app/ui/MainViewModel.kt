@@ -228,7 +228,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 message = "没有可下载的任务，请先解析链接并选择图文图片"
                 return@launch
             }
-            ready.forEach { TaskRepository.setStatus(it.id, TaskStatus.QUEUED) }
+            ready.forEach { TaskRepository.enqueueIfReady(it.id) }
             DownloadService.start(app)
             message = "已加入下载队列，共 ${ready.size} 条"
         }
@@ -240,7 +240,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val task = TaskRepository.byId(taskId) ?: return@launch
             if (task.statusEnum != TaskStatus.READY) return@launch
             if (!task.canDownload) { message = "请先选择要下载的图片"; return@launch }
-            TaskRepository.setStatus(taskId, TaskStatus.QUEUED)
+            if (!TaskRepository.enqueueIfReady(taskId)) return@launch
             DownloadService.start(app)
         }
     }

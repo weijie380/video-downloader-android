@@ -25,6 +25,11 @@ def main():
     assert ffmpeg and ffprobe, '需要 ffmpeg 和 ffprobe'
     with tempfile.TemporaryDirectory(prefix='videodl-recovery-') as folder:
         base = Path(folder)
+        plugin = base / 'plugins/serial/yt_dlp_plugins/postprocessor/serial_ffmpeg.py'
+        plugin.parent.mkdir(parents=True)
+        shutil.copyfile(ROOT / 'app/src/main/assets/serial_ffmpeg.py', plugin)
+        plugins = ['--plugin-dirs', str(base / 'plugins'), '--use-postprocessor',
+                   f'SerialFFmpeg:when=pre_process;lock_path={base / "ffmpeg.lock"}']
         subprocess.run([ffmpeg, '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=25',
                         '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '4', '-c:v', 'libx264',
                         '-preset', 'ultrafast', '-g', '25', '-c:a', 'aac', '-hls_time', '1',
@@ -64,7 +69,7 @@ def main():
                 file = base / 'metadata.json'
                 file.write_text(json.dumps(metadata))
                 return subprocess.run([sys.executable, str(ENGINE), '--load-info-json', str(file),
-                    *POLICY, '--ffmpeg-location', ffmpeg, '-o', str(output), *extra],
+                    *POLICY, *plugins, '--ffmpeg-location', ffmpeg, '-o', str(output), *extra],
                     capture_output=True, text=True, timeout=90)
 
             output = base / 'resumed.mp4'

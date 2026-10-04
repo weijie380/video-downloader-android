@@ -386,7 +386,7 @@ private fun QueueHeader(
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("下载队列", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        Text("${tasks.size} 条任务 · 删除条目不会删除已保存文件",
+        Text("${tasks.size} 条任务 · 最多同时下载 2 条\n删除条目不会删除已保存文件",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Button(onClick = onStart, enabled = readyCount > 0) {
