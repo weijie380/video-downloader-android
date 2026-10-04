@@ -4,6 +4,10 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.content.ContextWrapper
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.UUID
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.videodl.app.download.MediaStoreExporter
@@ -44,6 +48,9 @@ class ImageStorageTest {
             assertArrayEquals(bytes, saved)
             assertTrue(MediaStoreExporter.stillExists(context, exported.uri))
         } finally { MediaStoreExporter.remove(context, listOf(exported)) }
+        val next = store.add(bytes, "qwen-image-2.0", "第二轮本机测试：继续修改", store.load(), item.conversationId, item.id)
+        assertEquals(item.id, GeneratedImages(context).load().first { it.id == next.id }.parentId)
+        assertEquals(2, GeneratedImages(context).load().count { it.conversationId == item.conversationId })
         // 留下一张有明确测试文案的本机图供 UI 验证，测试结束不保留密钥。
     }
 
@@ -52,6 +59,54 @@ class ImageStorageTest {
         val before = store.load()
         assertTrue(runCatching { store.add("not an image".toByteArray(), "wan2.7-image", "fixture", before) }.isFailure)
         assertEquals(before, store.load())
+    }
+
+    @Test fun deletingRoundAndConversationPersistsAndKeepsExportedImage() {
+        val directory = File(context.cacheDir, "chat-test-${UUID.randomUUID()}").apply { mkdirs() }
+        val isolated = object : ContextWrapper(context) { override fun getFilesDir() = directory }
+        val store = GeneratedImages(isolated)
+        val first = store.add(fixture(), "qwen-image-2.0", "第一轮", emptyList(), "chat-a")
+        val second = store.add(fixture(), "qwen-image-2.0", "第二轮", listOf(first), "chat-a", first.id)
+        val other = store.add(fixture(), "wan2.7-image", "其他对话", listOf(second, first), "chat-b")
+        val exported = MediaStoreExporter.export(context, File(first.path), "delete-chat-fixture.png", "image/png", subFolder = "生图", replaceExisting = false)
+        try {
+            var loaded = GeneratedImages(isolated).load()
+            assertEquals(first.id, loaded.first { it.id == second.id }.parentId)
+            assertEquals("chat-a", loaded.first { it.id == second.id }.conversationId)
+            loaded = store.delete(setOf(second.id), loaded)
+            assertFalse(File(second.path).exists())
+            assertTrue(File(first.path).exists())
+            assertEquals(loaded, GeneratedImages(isolated).load())
+            loaded = store.delete(setOf(first.id), loaded)
+            assertFalse(File(first.path).exists())
+            assertEquals(listOf(other), GeneratedImages(isolated).load())
+            assertTrue(MediaStoreExporter.stillExists(context, exported.uri))
+            assertArrayEquals(fixture(), context.contentResolver.openInputStream(exported.uri)!!.use { it.readBytes() })
+            store.delete(setOf(other.id), loaded)
+            assertTrue(GeneratedImages(isolated).load().isEmpty())
+        } finally {
+            MediaStoreExporter.remove(context, listOf(exported))
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test fun legacyImagesMigrateToIndependentConversationsWithoutLosingFiles() {
+        val directory = File(context.cacheDir, "legacy-test-${UUID.randomUUID()}").apply { mkdirs() }
+        val isolated = object : ContextWrapper(context) { override fun getFilesDir() = directory }
+        try {
+            val folder = File(directory, "generated-images").apply { mkdirs() }
+            File(folder, "old.png").writeBytes(fixture())
+            File(folder, "history.json").writeText(JSONArray().put(JSONObject().put("id", "old-id")
+                .put("model", "qwen-image-2.0").put("prompt", "旧版记录").put("file", "old.png").put("created", 1)).toString())
+            val store = GeneratedImages(isolated)
+            val old = store.load().single()
+            assertEquals("old-id", old.conversationId)
+            assertNull(old.parentId)
+            val next = store.add(fixture(), old.model, "继续修改", listOf(old), old.conversationId, old.id)
+            assertEquals(2, GeneratedImages(isolated).load().size)
+            assertEquals(old.id, next.parentId)
+            assertTrue(File(old.path).exists())
+        } finally { directory.deleteRecursively() }
     }
 
     private fun fixture(): ByteArray {

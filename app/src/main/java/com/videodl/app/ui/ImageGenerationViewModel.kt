@@ -12,6 +12,7 @@ import kotlinx.coroutines.*
 import java.io.File
 import java.net.SocketTimeoutException
 import java.io.IOException
+import java.util.UUID
 
 class ImageGenerationViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application
@@ -32,6 +33,19 @@ class ImageGenerationViewModel(application: Application) : AndroidViewModel(appl
         private set
     var images by mutableStateOf<List<GeneratedImage>>(emptyList())
         private set
+    var conversationId by mutableStateOf(UUID.randomUUID().toString())
+        private set
+    var referenceId by mutableStateOf<String?>(null)
+        private set
+    var historyBusy by mutableStateOf(false)
+        private set
+    var pendingPrompt by mutableStateOf<String?>(null)
+        private set
+    val currentImages: List<GeneratedImage>
+        get() = images.asReversed().filter { it.conversationId == conversationId }.sortedBy { it.created }
+    val reference: GeneratedImage?
+        get() = currentImages.firstOrNull { it.id == referenceId } ?: currentImages.lastOrNull()
+    val canChangeHistory: Boolean get() = ready && !busy && !historyBusy && saving == null
     var saving by mutableStateOf<String?>(null)
         private set
     var savedIds by mutableStateOf<Set<String>>(emptySet())
@@ -45,6 +59,7 @@ class ImageGenerationViewModel(application: Application) : AndroidViewModel(appl
         viewModelScope.launch {
             try {
                 images = withContext(Dispatchers.IO) { store.load() }
+                images.firstOrNull()?.let { conversationId = it.conversationId; selectedModel = it.model }
                 hasKey = withContext(Dispatchers.IO) { ImageApiKey.read(app).isNotBlank() }
             } catch (t: Exception) { message = t.message ?: "生图设置读取失败" }
             finally { ready = true }
@@ -61,6 +76,45 @@ class ImageGenerationViewModel(application: Application) : AndroidViewModel(appl
     }
     fun selectModel(id: String) { if (!busy) selectedModel = id }
     fun changePrompt(value: String) { prompt = value.take(4000) }
+
+    fun newConversation() {
+        if (!canChangeHistory) return
+        conversationId = UUID.randomUUID().toString()
+        referenceId = null
+        prompt = ""
+        message = null
+    }
+    fun openConversation(id: String) {
+        if (!canChangeHistory || images.none { it.conversationId == id }) return
+        conversationId = id
+        referenceId = null
+        prompt = ""
+        message = null
+        currentImages.lastOrNull()?.let { selectedModel = it.model }
+    }
+    fun continueFrom(image: GeneratedImage) {
+        if (!canChangeHistory || image.conversationId != conversationId) return
+        referenceId = image.id
+        message = "下一轮将修改所选图片"
+    }
+    fun deleteImages(ids: Set<String>) {
+        if (!canChangeHistory) return
+        historyBusy = true
+        viewModelScope.launch {
+            try {
+                images = withContext(NonCancellable + Dispatchers.IO) { store.delete(ids, images) }
+                savedIds = savedIds - ids
+                if (referenceId in ids) referenceId = null
+                if (currentImages.isEmpty()) {
+                    conversationId = images.firstOrNull()?.conversationId ?: UUID.randomUUID().toString()
+                    referenceId = null
+                    prompt = ""
+                }
+                message = "记录已删除，已另存的图片保留"
+            } catch (t: Exception) { message = t.message ?: "删除记录失败" }
+            finally { historyBusy = false }
+        }
+    }
 
     fun saveKey(value: String, onSaved: () -> Unit, onError: (String) -> Unit) {
         viewModelScope.launch {
@@ -83,28 +137,33 @@ class ImageGenerationViewModel(application: Application) : AndroidViewModel(appl
     }
 
     fun generate() {
-        if (busy || !ready) return
+        if (busy || !ready || historyBusy || saving != null) return
         val input = prompt.trim()
         if (!hasKey) { message = "请先设置基元律动 API Key"; return }
         if (input.isEmpty()) { message = "请先输入图片描述"; return }
         if (models.none { it.id == selectedModel && it.available }) { message = "该模型暂不可用，请切换模型"; return }
         val model = selectedModel
+        val chat = conversationId
+        val source = reference
         busy = true
+        pendingPrompt = input
         message = null
         generation = viewModelScope.launch {
             try {
                 val key = withContext(Dispatchers.IO) { ImageApiKey.read(app) }
-                val bytes = client.generate(key, model, input)
+                val bytes = client.generate(key, model, input, source?.let { File(it.path) })
                 ensureActive()
                 // 写图和原子索引一起完成，取消不能留下不完整记录。
-                val image = withContext(NonCancellable + Dispatchers.IO) { store.add(bytes, model, input, images) }
+                val image = withContext(NonCancellable + Dispatchers.IO) { store.add(bytes, model, input, images, chat, source?.id) }
                 images = listOf(image) + images
-                message = "图片已生成，点击预览或保存到下载目录"
+                referenceId = null
+                prompt = ""
+                message = "图片已生成，可继续发送修改要求"
             } catch (t: CancellationException) { throw t }
             catch (_: SocketTimeoutException) { message = "生图请求超时，可能已在服务端处理。请先查看基元律动调用记录，再决定是否重新生成。" }
             catch (_: IOException) { message = "网络连接中断。请检查网络，并在基元律动调用记录确认是否已生成；软件不会自动重复提交。" }
             catch (t: Exception) { message = t.message ?: "生成失败，请稍后再试" }
-            finally { busy = false }
+            finally { busy = false; pendingPrompt = null }
         }
     }
     fun cancel() {
@@ -113,7 +172,7 @@ class ImageGenerationViewModel(application: Application) : AndroidViewModel(appl
     }
 
     fun saveImage(image: GeneratedImage) {
-        if (saving != null) return
+        if (saving != null || historyBusy) return
         saving = image.id
         viewModelScope.launch {
             try {

@@ -7,6 +7,8 @@ import kotlinx.coroutines.withContext
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
+import java.io.File
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -26,12 +28,25 @@ class TokenRhythmClient(
         }
     }
 
-    suspend fun generate(key: String, model: String, prompt: String): ByteArray = withContext(Dispatchers.IO) {
+    suspend fun generate(key: String, model: String, prompt: String, reference: File? = null): ByteArray = withContext(Dispatchers.IO) {
         require(key.isNotBlank()) { "请先设置 API Key" }
         val payload = ImageProtocol.request(model, prompt).toString()
-        val source = execute(Request.Builder().url("$baseUrl/v1/images/generations")
+        val body = if (reference == null) payload.toRequestBody("application/json; charset=utf-8".toMediaType()) else {
+            require(reference.isFile && reference.length() in 1..ImageProtocol.MAX_IMAGE_BYTES.toLong()) { "参考图片不存在或过大，请从其他图片继续或新建对话" }
+            val header = ByteArray(32)
+            reference.inputStream().use { it.read(header) }
+            val mime = when (ImageFileType.extension(header)) {
+                "jpg" -> "image/jpeg"; "png" -> "image/png"; "webp" -> "image/webp"
+                else -> error("参考图片格式暂不支持修改")
+            }
+            MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("model", model).addFormDataPart("prompt", prompt.trim()).addFormDataPart("n", "1")
+                .addFormDataPart("image", reference.name, reference.asRequestBody(mime.toMediaType())).build()
+        }
+        val endpoint = if (reference == null) "generations" else "edits"
+        val source = execute(Request.Builder().url("$baseUrl/v1/images/$endpoint")
             .header("Authorization", "Bearer $key")
-            .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType())).build(),
+            .post(body).build(),
             limit = ImageProtocol.MAX_IMAGE_BYTES * 4 / 3 + 4096) { response, bytes ->
             check(response.isSuccessful) { ImageProtocol.error(response.code, bytes.toString(Charsets.UTF_8), key) }
             ImageProtocol.parseImage(bytes.toString(Charsets.UTF_8))

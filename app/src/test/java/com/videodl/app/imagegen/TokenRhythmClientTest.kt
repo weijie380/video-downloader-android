@@ -13,6 +13,7 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.util.Base64
 import java.util.concurrent.TimeUnit
+import java.io.File
 
 class TokenRhythmClientTest {
     private val png = Base64.getDecoder().decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aP9sAAAAASUVORK5CYII=")
@@ -127,5 +128,57 @@ class TokenRhythmClientTest {
         }.build()
         assertTrue(runCatching { TokenRhythmClient(client = transport).generate("test-key", "wan2.7-image", "一棵树") }.isFailure)
         assertEquals(2, count)
+    }
+
+    @Test fun editsBothModelsWithActualPreviousImageAndNewInstruction() = runBlocking {
+        val reference = File.createTempFile("previous-round", ".png")
+        val prior = png + "previous-round-content".toByteArray()
+        reference.writeBytes(prior)
+        try {
+            MockWebServer().use { server ->
+                server.start()
+                val client = TokenRhythmClient(server.url("/").toString().trimEnd('/'))
+                ImageProtocol.models.forEach { model ->
+                    server.enqueue(MockResponse().setBody("""{"data":[{"b64_json":"${Base64.getEncoder().encodeToString(png)}"}]}"""))
+                    assertArrayEquals(png, client.generate("test-key", model.id, "把天空改成蓝色", reference))
+                    val request = server.takeRequest()
+                    assertEquals("/v1/images/edits", request.path)
+                    assertEquals("Bearer test-key", request.getHeader("Authorization"))
+                    assertTrue(request.getHeader("Content-Type")!!.startsWith("multipart/form-data"))
+                    val body = request.body.readUtf8()
+                    assertTrue(body.contains("name=\"image\"; filename=\"${reference.name}\""))
+                    assertTrue(body.contains("Content-Type: image/png"))
+                    assertTrue(body.contains("previous-round-content"))
+                    assertTrue(body.contains("把天空改成蓝色"))
+                    assertTrue(body.contains(model.id))
+                }
+            }
+        } finally { reference.delete() }
+    }
+
+    @Test fun failedEditNeverFallsBackToFreshImageGeneration() = runBlocking {
+        val reference = File.createTempFile("previous-round", ".png").apply { writeBytes(png) }
+        try {
+            MockWebServer().use { server ->
+                server.start()
+                server.enqueue(MockResponse().setResponseCode(404).setBody("""{"message":"编辑接口暂不可用"}"""))
+                val result = runCatching { TokenRhythmClient(server.url("/").toString().trimEnd('/'))
+                    .generate("test-key", "wan2.7-image", "换成夜景", reference) }
+                assertTrue(result.isFailure)
+                assertEquals("/v1/images/edits", server.takeRequest().path)
+                assertEquals(1, server.requestCount)
+            }
+        } finally { reference.delete() }
+    }
+
+    @Test fun missingReferenceDoesNotSubmitBillableRequest() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val reference = File.createTempFile("missing-reference", ".png").apply { delete() }
+            val result = runCatching { TokenRhythmClient(server.url("/").toString().trimEnd('/'))
+                .generate("test-key", "qwen-image-2.0", "修改图片", reference) }
+            assertTrue(result.isFailure)
+            assertEquals(0, server.requestCount)
+        }
     }
 }
